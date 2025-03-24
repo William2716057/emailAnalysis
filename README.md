@@ -68,6 +68,3 @@ Links found in the email: ['http://example.com']
 - For security purposes, ensure the VirusTotal API key is kept confidential.
 - The code includes logic to filter out common spam patterns, making it useful for forensic analysis or email filtering solutions.
 
-## License
-This project is licensed under the MIT License.
-
