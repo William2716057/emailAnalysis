@@ -8,6 +8,8 @@ from datetime import datetime
 from hashlib import md5
 from datetime import datetime
 
+
+
 #1. Is email in English
 #2. Is greater than 4 words
 #3. Does address not end in corporate domain @gmail, @yahoo, @aol, @outlook, @icloud
@@ -23,7 +25,7 @@ from datetime import datetime
 #13. Does belong to accepted category
 
 # Open and read the email file
-with open("test.eml", "r") as file:
+with open("test1.eml", "r") as file:
     raw_email = file.read()
 
 email_message = message_from_string(raw_email, policy=default)
