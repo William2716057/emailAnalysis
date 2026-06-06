@@ -1,12 +1,14 @@
-from langdetect import detect
 import re
+import sys
+import os
+import json
+import argparse
 import emoji
-import requests
 from email import message_from_string
 from email.policy import default
 from datetime import datetime
 from hashlib import md5
-from datetime import datetime
+from langdetect import detect, LangDetectException
 
 
 
@@ -24,27 +26,417 @@ from datetime import datetime
 #12. Does contain keywords indicating promotional
 #13. Does belong to accepted category
 
-# Open and read the email file
-with open("test1.eml", "r") as file:
-    raw_email = file.read()
+CUTOFF_DATE = datetime(2021, 1, 10)
 
-email_message = message_from_string(raw_email, policy=default)
-email_body = email_message.get_body(preferencelist=('plain')).get_content()
+CONSUMER_DOMAINS = {
+    "gmail.com", "yahoo.com", "aol.com", "outlook.com",
+    "icloud.com", "hotmail.com", "live.com", "msn.com",
+    "protonmail.com", "mail.com",
+} #continue adding
 
-#check whether domain is corpor
-def is_not_corporate_domain(email):
-    corporate_domains = ["gmail.com", "yahoo.com", "aol.com", "outlook.com", "icloud.com"]
-    domain = email.split('@')[-1]
-    return domain not in corporate_domains
+PROMOTIONAL_KEYWORDS = {
+    "unsubscribe", "click here", "limited time", "act now", "special offer",
+    "free trial", "exclusive deal", "buy now", "sale ends", "discount",
+    "% off", "don't miss out", "win a", "you've been selected",
+    "congratulations you", "earn money", "make money fast",
+    "this is not spam", "opt out", "opt-out", "click below to",
+    "no longer wish to receive", "remove me from", "marketing",
+    "advertisement", "sponsor", "promotional",
+} #continue adding
+ 
+BUSINESS_INDICATORS = {
+    "inc", "llc", "ltd", "corp", "co", "gmbh", "bv", "pty",
+    "plc", "ag", "sa", "srl", "pte", "ngo", "foundation",
+    "group", "services", "solutions", "technologies", "consulting",
+    "enterprises", "holdings", "international",
+}
 
-def contains_no_emoji(text):
-    return not any(emoji.is_emoji(char) for char in text)
+#accepted categories
+ACCEPTED_CATEGORIES = {
+    "Travel Update": {
+        "itinerary", "flight", "departure", "arrival", "gate", "boarding",
+        "car rental", "hotel", "check-in", "check out", "reservation update",
+        "trip update", "train", "bus", "cruise", "ferry", "tour package",
+        "booking update", "travel alert", "schedule change",
+    },
+    "Utility & Service Notice": {
+        "scheduled maintenance", "power outage", "service disruption",
+        "electricity", "water supply", "internet outage", "service interruption",
+        "telephone", "gas supply", "network maintenance", "planned outage",
+    },
+    "Appointment Reminder": {
+        "appointment reminder", "your appointment", "scheduled appointment",
+        "physician", "dental", "dentist", "therapy", "therapist",
+        "doctor's appointment", "medical appointment", "clinic",
+        "reminder: appointment",
+    },
+    "Calendar Invite": {
+        "you're invited", "calendar invite", "meeting invite",
+        "interview invitation", "call invitation", "join the meeting",
+        "has invited you", "rsvp", "please join",
+    },
+    "Calendar Update": {
+        "meeting update", "calendar update", "event update",
+        "rescheduled", "time change", "meeting time has changed",
+        "event change", "updated invitation",
+    },
+    "Digital Signature": {
+        "please sign", "e-signature", "digital signature", "docusign",
+        "hellosign", "sign the document", "signature required",
+        "action required: sign", "awaiting your signature",
+    },
+    "Lease & Property Notice": {
+        "lease", "tenancy", "rental agreement", "property notice",
+        "landlord", "tenant", "eviction", "rent due", "move-in",
+        "move-out", "property inspection", "notice to vacate",
+    },
+    "Travel/Reservation Confirmation": {
+        "booking confirmation", "reservation confirmation", "your booking",
+        "itinerary confirmation", "hotel confirmation", "flight confirmation",
+        "car rental confirmation", "restaurant reservation",
+        "your reservation", "confirmed booking", "booking reference",
+        "airbnb", "confirmation number",
+    },
+    "Order Confirmation": {
+        "order confirmation", "your order", "order #", "order number",
+        "thank you for your order", "purchase confirmation",
+        "subscription confirmed", "food order", "order placed",
+    },
+    "Order Receipt": {
+        "receipt", "payment receipt", "your receipt", "invoice",
+        "amount charged", "payment of", "subscription receipt",
+        "uber receipt", "lyft receipt", "gift card",
+    },
+    "Shipment": {
+        "tracking", "shipment", "shipped", "out for delivery",
+        "delivery confirmation", "package", "parcel", "order dispatched",
+        "estimated delivery", "delivery failed", "attempted delivery",
+        "pickup ready", "freight", "courier",
+    },
+    "Bill Statement": {
+        "bill statement", "monthly statement", "payment due",
+        "payment statement", "billing summary", "amount due",
+        "your bill", "statement of account", "invoice attached",
+    },
+    "Bank Statement": {
+        "bank statement", "account statement", "trading account",
+        "fund transfer", "transaction summary", "wire transfer",
+        "direct deposit", "account activity", "monthly statement",
+    },
+}
 
-def find_links(text):
+TSE_SIGNALS = {
+    "account number", "account balance", "transaction id", "reference number",
+    "case number", "policy number", "membership number", "patient id",
+    "invoice number", "order id", "tracking number", "booking reference",
+    "confirmation number", "contract number", "claim number", "tax id",
+    "social security", "date of birth", "national id",
+}
+ 
 
-    # Regular expression to find URLs in the text
-    url_pattern = re.compile(r'https?://\S+|www\.\S+')
+SEEN_FILE = "repeat_subjects.json"
+ 
+def load_seen_subjects():
+    if os.path.exists(SEEN_FILE):
+        with open(SEEN_FILE, "r") as f:
+            return set(json.load(f))
+    return set()
+ 
+def save_seen_subjects(seen):
+    with open(SEEN_FILE, "w") as f:
+        json.dump(list(seen), f)
+        
+
+#get body
+def get_plain_body(email_message):
+
+    body_part = email_message.get_body(preferencelist=("plain",))
+    if body_part is None:
+        return ""
+    try:
+        return body_part.get_content()
+    except Exception:
+        return ""
+   
+ #extract sender address
+def get_sender_email(email_message):
+    from_header = email_message.get("From", "")
+    match = re.search(r"<(.+?)>", from_header)
+    if match:
+        return match.group(1).strip().lower()
+
+    if "@" in from_header:
+        return from_header.strip().lower()
+    return ""
+ 
+#extract names from headers 
+def get_sender_name(email_message):
+    from_header = email_message.get("From", "")
+    match = re.search(r'^"?([^"<>]+)"?\s*<', from_header)
+    if match:
+        name = match.group(1).strip()
+        return name if name else ""
+    return ""
+ 
+#return urls in email file
+def find_urls(text):
+    url_pattern = re.compile(r"https?://\S+|www\.\S+")
     return url_pattern.findall(text)
+ 
+
+def text_lower(email_message):
+    """Combined lower-cased subject + body for keyword scanning."""
+    subject = email_message.get("Subject", "")
+    body = get_plain_body(email_message)
+    return (subject + " " + body).lower()
+ 
+#rules
+
+#rule one: emails must be in English
+def rule_is_english(body):
+    if not body.strip():
+        return False, "Empty body"
+    try:
+        lang = detect(body)
+        return lang == "en", f"Detected language: {lang}"
+    except LangDetectException:
+        return False, "Could not detect language"
+ 
+#rule two: must contain minimum number of words
+def rule_min_word_count(body, minimum=4):
+    count = len(body.split())
+    return count > minimum, f"Word count: {count}"
+ 
+#rule three: must not be a consumer domain
+def rule_not_consumer_domain(email_message):
+    addr = get_sender_email(email_message)
+    if not addr:
+        return False, "No sender address found"
+    domain = addr.split("@")[-1]
+    passed = domain not in CONSUMER_DOMAINS
+    return passed, f"Sender domain: {domain}"
+ 
+#rule four: must have sender name
+def rule_has_sender_name(email_message):
+    name = get_sender_name(email_message)
+    return bool(name), f"Sender name: '{name}'"
+ 
+#rule five subject must not start with Re
+def rule_not_reply_or_forward(email_message):
+    subject = email_message.get("Subject", "")
+    flags = re.IGNORECASE
+    is_reply = bool(re.match(r"\s*re\s*:", subject, flags))
+    is_fwd   = bool(re.match(r"\s*fw(d)?\s*:", subject, flags))
+    passed = not (is_reply or is_fwd)
+    return passed, f"Subject: '{subject}'"
+ 
+#Rule six must not contain emojis
+def rule_no_emoji(email_message):
+    subject = email_message.get("Subject", "")
+    body    = get_plain_body(email_message)
+    full    = subject + body
+    has_emoji = any(emoji.is_emoji(ch) for ch in full)
+    return not has_emoji, "Emoji found" if has_emoji else "No emoji"
+ 
+#rule seven must be sent after cut off date
+def rule_is_recent(email_message):
+    date_str = email_message.get("Date", "")
+    if not date_str:
+        return False, "No Date header"
+    # various date formats
+    formats = [
+        "%a, %d %b %Y %H:%M:%S %z",
+        "%d %b %Y %H:%M:%S %z",
+        "%a, %d %b %Y %H:%M:%S",
+    ]
+    parsed = None
+    for fmt in formats:
+        try:
+            parsed = datetime.strptime(date_str.strip(), fmt)
+            break
+        except ValueError:
+            continue
+    if parsed is None:
+        return False, f"Could not parse date: '{date_str}'"
+    naive = parsed.replace(tzinfo=None)
+    passed = naive > CUTOFF_DATE
+    return passed, f"Email date: {naive.date()} (cutoff: {CUTOFF_DATE.date()})"
+
+#rule eight should contain transactional/sensitive/exclusive signals
+def rule_is_tse(email_message): #transactional/sensitive/exclusive 
+    combined = text_lower(email_message)
+    found = [sig for sig in TSE_SIGNALS if sig in combined]
+    passed = len(found) > 0
+    detail = f"TSE signals found: {found}" if found else "No TSE signals detected"
+    return passed, detail
+
+ #rule nine must not be a duplicate 
+def rule_not_duplicate(email_message, seen_subjects):
+    subject = email_message.get("Subject", "")
+    h = md5(subject.strip().encode()).hexdigest()
+    if h in seen_subjects:
+        return False, f"Duplicate subject hash: {h}"
+    seen_subjects.add(h)
+    return True, "Unique subject"
+ 
+#rule ten must be a business or organisation 
+def rule_is_business_sender(email_message):
+    name   = get_sender_name(email_message).lower()
+    domain = get_sender_email(email_message).split("@")[-1].lower()
+    # Check for business words
+    name_words = set(re.split(r"[\s,.\-]+", name))
+    if name_words & BUSINESS_INDICATORS:
+        return True, f"Business indicator in sender name: '{name}'"
+    # Check domain for business words
+    domain_parts = set(re.split(r"[\.\-]+", domain))
+    if domain_parts & BUSINESS_INDICATORS:
+        return True, f"Business indicator in domain: '{domain}'"
+    # Non-consumer domain is itself a reasonable proxy
+    if domain not in CONSUMER_DOMAINS and domain:
+        return True, f"Non-consumer domain treated as business: '{domain}'"
+    return False, f"No business indicators found (name='{name}', domain='{domain}')"
+
+ #rule eleven must not contain promotional language 
+def rule_not_promotional(email_message):
+    combined = text_lower(email_message)
+    found = [kw for kw in PROMOTIONAL_KEYWORDS if kw in combined]
+    passed = len(found) == 0
+    detail = f"Promotional keywords found: {found}" if found else "No promotional keywords"
+    return passed, detail
+ 
+#rule twelve must match accepted categories
+def rule_accepted_category(email_message):
+    combined = text_lower(email_message)
+    matched = []
+    for category, keywords in ACCEPTED_CATEGORIES.items():
+        if any(kw in combined for kw in keywords):
+            matched.append(category)
+    passed = len(matched) > 0
+    detail = f"Matched categories: {matched}" if matched else "No accepted category matched"
+    return passed, detail
+
+
+#run against all above rules
+def process_email(path, seen_subjects, verbose=False):
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            raw = f.read()
+    except OSError as e:
+        print(f"[ERROR] Could not read {path}: {e}")
+        return False, {}
+ 
+    msg  = message_from_string(raw, policy=default)
+    body = get_plain_body(msg)
+ 
+    rules = [
+        ("Language (English)", rule_is_english(body)),
+        ("Word count: ",rule_min_word_count(body)),
+        ("Non-consumer domain: ",rule_not_consumer_domain(msg)),
+        ("Sender name present ",rule_has_sender_name(msg)),
+        ("Not reply / forward ",rule_not_reply_or_forward(msg)),
+        ("No emoji ",rule_no_emoji(msg)),
+        ("Date: ",rule_is_recent(msg)),
+        ("TSE signals: ",rule_is_tse(msg)),
+        ("10 Not duplicate: ",rule_not_duplicate(msg, seen_subjects)),
+        ("11 Business sender: ",rule_is_business_sender(msg)),
+        ("12 Not promotional: ",rule_not_promotional(msg)),
+        ("13 Accepted category: ",rule_accepted_category(msg)),
+    ]
+ 
+    results = {}
+    all_passed = True
+    for label, (passed, detail) in rules:
+        results[label] = {"passed": passed, "detail": detail}
+        if not passed:
+            all_passed = False
+ 
+    # URL extraction 
+    urls = find_urls(body)
+    results["URLs found"] = {"passed": None, "detail": urls if urls else "None"}
+ 
+    # Results
+    print(f"\n{'='*60}")
+    print(f"File: {os.path.basename(path)}")
+    print(f"From: {msg.get('From', 'N/A')}")
+    print(f"Subj: {msg.get('Subject', 'N/A')}")
+    print(f"{'='*60}")
+ 
+    for label, info in results.items():
+        if info["passed"] is None:
+            status = "....."
+        elif info["passed"]:
+            status = "Passed"
+        else:
+            status = "Failed"
+ 
+        if verbose or not info["passed"]:
+            print(f"{status}  {label}")
+            print(f"{info['detail']}")
+        else:
+            print(f"  {status}  {label}")
+ 
+    verdict = "ACCEPTED" if all_passed else "REJECTED"
+    print(f"\n Verdict: {verdict}\n")
+ 
+    return all_passed, results
+ 
+ 
+def process_path(path, seen_subjects, verbose=False):
+    if os.path.isdir(path):
+        files = [
+            os.path.join(path, f)
+            for f in sorted(os.listdir(path))
+            if f.lower().endswith(".eml")
+        ]
+        if not files:
+            print(f"No .eml files found in {path}")
+            return
+        accepted = 0
+        for fp in files:
+            passed, _ = process_email(fp, seen_subjects, verbose)
+            if passed:
+                accepted += 1
+        print(f"\nSummary: {accepted}/{len(files)} emails accepted.")
+    elif os.path.isfile(path):
+        process_email(path, seen_subjects, verbose)
+    else:
+        print(f"Path not found: {path}")
+
+#use cli interface 
+#python phishing_email_detection.py <email.eml>
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Filter and classify .eml files against rules."
+    )
+    parser.add_argument("path", help="Path to a .eml file or a directory of .eml files")
+    parser.add_argument(
+        "--verbose", "-v",
+        action="store_true",
+        help="Print detail for every rule",
+    )
+    parser.add_argument(
+        "--reset-duplicates",
+        action="store_true",
+        help="Clear the persisted duplicate-subject cache before running",
+    )
+    args = parser.parse_args()
+ 
+    seen_subjects = set()
+    if args.reset_duplicates:
+        if os.path.exists(SEEN_FILE):
+            os.remove(SEEN_FILE)
+        print("Duplicate cache cleared.")
+    else:
+        seen_subjects = load_seen_subjects()
+ 
+    process_path(args.path, seen_subjects, verbose=args.verbose)
+ 
+    save_seen_subjects(seen_subjects)
+ 
+ 
+if __name__ == "__main__":
+    main()
 
 
 #UNCOMMENT HERE IF USING VIRUS TOTAL API
@@ -56,97 +448,6 @@ def find_links(text):
 #    response = requests.get(BASE_URL, params=params)
 #    return response.json()
 
-
-def extract_subject(email_message):
-    return email_message['Subject'] or ""
-
-def is_subject_valid(subject):
-    clean_subject = re.sub(r'\b\w{1,2}\b|\d+|Re:|Fw:', '', subject).strip()
-    word_count = len(clean_subject.split())
-    return word_count >= 4
-
-def contains_sender_name(email_message):
-    sender = email_message['From']
-    if sender:
-        match = re.search(r'\"?([^\"\<\>]+)\"?\s*<', sender)
-        if match:
-            return True
-    return False
-
-def is_recent(email_message):
-    email_date = email_message['Date']
-    email_datetime = datetime.strptime(email_date, '%a, %d %b %Y %H:%M:%S %z')
-    
-    # Convert to offset-naive datetime by removing timezone info
-    email_datetime_naive = email_datetime.replace(tzinfo=None)
-    
-    # Compare with a naive datetime
-    return email_datetime_naive > datetime(2021, 1, 1)
-
-def is_not_duplicate(subject):
-    subject_hash = md5(subject.encode()).hexdigest()
-    if subject_hash in seen_subjects:
-        return False
-    seen_subjects.add(subject_hash)
-    return True
-seen_subjects = set()
-
-# Rule Checks
-language = detect(email_body)
-is_english = language == 'en'
-print(f"Language detected: {language} (Is English: {is_english})")
-
-subject = extract_subject(email_message)
-valid_subject = is_subject_valid(subject)
-print(f"Is subject valid (at least 4 words excluding numbers/dates/etc.)? {valid_subject}")
-
-sender_email = re.search(r'From:.*<(.+?)>', raw_email)
-if sender_email:
-    email_address = sender_email.group(1)
-
-# Check if the email is in English
-print("Language detected:", detect(raw_email))
-
-# Count words in the email
-word_count = len(raw_email.split())
-is_greater_than_4_words = word_count > 4
-print(f"Is the email longer than 4 words? {is_greater_than_4_words}")
-
-# Extract sender's email address
-sender_email = re.search(r'From:.*<(.+?)>', raw_email)
-if sender_email:
-    email_address = sender_email.group(1)
-    print(f"Sender's email: {email_address}")
-    
-    not_corporate_domain = is_not_corporate_domain(email_address)
-    print(f"Is the email address not a corporate domain? {not_corporate_domain}")
-else:
-    print("Sender's email address not found.")
-
-has_sender_name = contains_sender_name(email_message)
-print(f"Does the email have a sender name? {has_sender_name}")
-
-recent_email = is_recent(email_message)
-print(f"Is the email recent (after Jan 1st, 2021)? {recent_email}")
-
-no_re_fwd = 'Re:' not in subject and 'Fw:' not in subject
-print(f"Subject does not contain 'Re:' or 'Fw:': {no_re_fwd}")
-
-no_emoji_in_subject = contains_no_emoji(subject)
-print(f"Subject does not contain emojis: {no_emoji_in_subject}")
-
-not_duplicate = is_not_duplicate(subject)
-print(f"Is the email subject not a duplicate? {not_duplicate}")
-
-links = find_links(email_body)
-# Check for emojis in the email content
-no_emoji = contains_no_emoji(raw_email)
-print(f"No emoji in email content? {no_emoji}")
-
-# Find and print links in the email content
-links = find_links(raw_email)
-
-print(f"Links found in the email: {links}")
 
 #def is_malicious(url):
 #    result = check_url(url)
@@ -179,7 +480,7 @@ print(f"Links found in the email: {links}")
 #        print(f"Report: {report}")
         
 
-travelKeywords = {"Booking reference"}
+#travelKeywords = {"Booking reference"}
 
         
 
